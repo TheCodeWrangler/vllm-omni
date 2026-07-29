@@ -58,6 +58,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
         self._tools: list[dict[str, Any]] | None = None
+        self._speaker: str | None = None
         # index (parser-assigned, per generation) -> {"call_id", "name", "arguments"}
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -68,6 +69,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             tools = event.get("tools")
             if tools is not None:
                 self._tools = tools
+            speaker = event.get("voice") or event.get("speaker")
+            if speaker is not None:
+                self._speaker = speaker
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
@@ -106,7 +110,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         seam for extra per-connection state like tools, so this reimplements
         its (short) body directly rather than patching upstream vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, self.serving.model_config, tools=self._tools
+            audio_stream, input_stream, self.serving.model_config, tools=self._tools, speaker=self._speaker
         )
         async for prompt in stream_input_iter:
             yield await self._render_prompt(prompt)

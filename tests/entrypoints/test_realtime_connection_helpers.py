@@ -28,6 +28,7 @@ def realtime_conn() -> RealtimeConnection:
 def tool_call_conn() -> RealtimeConnection:
     conn = RealtimeConnection.__new__(RealtimeConnection)
     conn._tools = None
+    conn._speaker = None
     conn._tool_result_queue = asyncio.Queue()
     conn._pending_tool_calls = {}
     return conn
@@ -146,3 +147,38 @@ class TestRealtimeConnectionToolCallEventRouting:
         asyncio.run(tool_call_conn.handle_event(event))
 
         base_handle_event.assert_awaited_once_with(event)
+
+
+class TestRealtimeConnectionSpeakerRouting:
+    """handle_event's speaker/voice-selection addition to session.update -
+    threaded into buffer_realtime_audio's own `speaker` param (see
+    Qwen3OmniMoeForConditionalGeneration.buffer_realtime_audio), the same
+    `additional_information={"speaker": [...]}` shape /v1/chat/completions
+    already uses (serving_chat.py)."""
+
+    def _patch_base_handle_event(self, mocker):
+        return mocker.patch.object(VllmRealtimeConnection, "handle_event", new_callable=mocker.AsyncMock)
+
+    def test_session_update_captures_voice_field(self, tool_call_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+
+        asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni", "voice": "aiden"}))
+
+        assert tool_call_conn._speaker == "aiden"
+
+    def test_session_update_captures_speaker_field(self, tool_call_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+
+        asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni", "speaker": "ethan"}))
+
+        assert tool_call_conn._speaker == "ethan"
+
+    def test_session_update_without_voice_or_speaker_leaves_existing_value_untouched(
+        self, tool_call_conn, mocker
+    ) -> None:
+        self._patch_base_handle_event(mocker)
+        tool_call_conn._speaker = "aiden"
+
+        asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
+
+        assert tool_call_conn._speaker == "aiden"
