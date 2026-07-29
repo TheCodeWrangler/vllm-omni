@@ -101,7 +101,9 @@ class RealtimeConnection(VllmRealtimeConnection):
         # set on the pre-render prompt (e.g. buffer_realtime_audio's `speaker`) is
         # silently dropped unless reapplied to the *rendered* engine_input, exactly
         # like serving_chat.py._preprocess_chat does for /v1/chat/completions.
-        additional_information = parsed_prompt.get("additional_information") if isinstance(parsed_prompt, dict) else None
+        additional_information = (
+            parsed_prompt.get("additional_information") if isinstance(parsed_prompt, dict) else None
+        )
         if additional_information:
             engine_input["additional_information"] = additional_information
         return StreamingInput(prompt=engine_input)
