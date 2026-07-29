@@ -295,6 +295,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         # list under "speaker" in additional_information, read back out by
         # talker_preprocess_prefill via payload.get("speaker").
         additional_information = {"speaker": [speaker]} if speaker else None
+        extra_prompt_kwargs = {"additional_information": additional_information} if additional_information else {}
 
         # In non-async-chunk (full-payload) mode the engine treats each
         # streaming TokensPrompt as a fresh decode, so mid-stream segment
@@ -311,7 +312,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         multi_modal_data={"audio": segment},
-                        **({"additional_information": additional_information} if additional_information else {}),
+                        **extra_prompt_kwargs,
                     )
 
         remaining = buffer.flush()
@@ -319,7 +320,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
                 multi_modal_data={"audio": remaining},
-                **({"additional_information": additional_information} if additional_information else {}),
+                **extra_prompt_kwargs,
             )
 
     # ==================== Device utilities ====================
