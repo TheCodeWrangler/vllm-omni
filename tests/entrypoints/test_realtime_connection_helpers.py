@@ -30,6 +30,7 @@ def tool_call_conn() -> RealtimeConnection:
     conn = RealtimeConnection.__new__(RealtimeConnection)
     conn._tools = None
     conn._speaker = None
+    conn._instructions = None
     conn._tool_result_queue = asyncio.Queue()
     conn._pending_tool_calls = {}
     return conn
@@ -183,6 +184,26 @@ class TestRealtimeConnectionSpeakerRouting:
         asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
 
         assert tool_call_conn._speaker == "aiden"
+
+    def test_session_update_captures_instructions(self, tool_call_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+        event = {
+            "type": "session.update",
+            "model": "qwen3-omni",
+            "instructions": "Only use tools directly relevant to what the user asked.",
+        }
+
+        asyncio.run(tool_call_conn.handle_event(event))
+
+        assert tool_call_conn._instructions == "Only use tools directly relevant to what the user asked."
+
+    def test_session_update_without_instructions_leaves_existing_value_untouched(self, tool_call_conn, mocker) -> None:
+        self._patch_base_handle_event(mocker)
+        tool_call_conn._instructions = "existing"
+
+        asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
+
+        assert tool_call_conn._instructions == "existing"
 
 
 class TestRenderPromptPropagatesAdditionalInformation:

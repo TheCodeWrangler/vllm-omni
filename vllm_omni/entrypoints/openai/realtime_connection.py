@@ -59,6 +59,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._realtime_audio_ref: np.ndarray | None = None
         self._tools: list[dict[str, Any]] | None = None
         self._speaker: str | None = None
+        self._instructions: str | None = None
         # index (parser-assigned, per generation) -> {"call_id", "name", "arguments"}
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -72,6 +73,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             speaker = event.get("voice") or event.get("speaker")
             if speaker is not None:
                 self._speaker = speaker
+            instructions = event.get("instructions")
+            if instructions is not None:
+                self._instructions = instructions
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
@@ -114,13 +118,19 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools` through to the model's `buffer_realtime_audio`.
-        The base class's `transcribe_realtime` has a fixed
-        (audio_stream, input_stream, model_config) call signature with no
-        seam for extra per-connection state like tools, so this reimplements
-        its (short) body directly rather than patching upstream vLLM."""
+        threads `self._tools`/`self._speaker`/`self._instructions` through to
+        the model's `buffer_realtime_audio`. The base class's
+        `transcribe_realtime` has a fixed (audio_stream, input_stream,
+        model_config) call signature with no seam for extra per-connection
+        state like these, so this reimplements its (short) body directly
+        rather than patching upstream vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, self.serving.model_config, tools=self._tools, speaker=self._speaker
+            audio_stream,
+            input_stream,
+            self.serving.model_config,
+            tools=self._tools,
+            speaker=self._speaker,
+            instructions=self._instructions,
         )
         async for prompt in stream_input_iter:
             yield await self._render_prompt(prompt)
