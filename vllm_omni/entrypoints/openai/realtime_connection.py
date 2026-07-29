@@ -96,6 +96,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         model_config = self.serving.model_config
         parsed_prompt = parse_model_prompt(model_config, prompt)
         (engine_input,) = await self.serving.renderer.render_cmpl_async([parsed_prompt])
+        # render_cmpl_async's internal pipeline (BaseRenderer.process_for_engine_async)
+        # only carries over fields it explicitly knows about - additional_information
+        # set on the pre-render prompt (e.g. buffer_realtime_audio's `speaker`) is
+        # silently dropped unless reapplied to the *rendered* engine_input, exactly
+        # like serving_chat.py._preprocess_chat does for /v1/chat/completions.
+        additional_information = parsed_prompt.get("additional_information") if isinstance(parsed_prompt, dict) else None
+        if additional_information:
+            engine_input["additional_information"] = additional_information
         return StreamingInput(prompt=engine_input)
 
     async def _buffer_realtime_audio_with_tools(
@@ -116,7 +124,13 @@ class RealtimeConnection(VllmRealtimeConnection):
             yield await self._render_prompt(prompt)
 
     async def _render_token_prompt(self, prompt_token_ids: list[int]) -> AsyncGenerator[StreamingInput, None]:
-        yield await self._render_prompt(TokensPrompt(prompt_token_ids=prompt_token_ids))
+        # Tool-call continuation: keep the selected voice for the model's actual
+        # spoken reply too, not just the initial turn - otherwise it would silently
+        # fall back to the default speaker once generation resumes post-tool-call.
+        token_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if self._speaker:
+            token_prompt["additional_information"] = {"speaker": [self._speaker]}
+        yield await self._render_prompt(token_prompt)
 
     @staticmethod
     def _tensor_to_numpy(value) -> np.ndarray | None:

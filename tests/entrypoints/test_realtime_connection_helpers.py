@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
+from vllm.inputs import TokensPrompt
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -182,3 +183,42 @@ class TestRealtimeConnectionSpeakerRouting:
         asyncio.run(tool_call_conn.handle_event({"type": "session.update", "model": "qwen3-omni"}))
 
         assert tool_call_conn._speaker == "aiden"
+
+
+class TestRenderPromptPropagatesAdditionalInformation:
+    """Regression test for a real bug: BaseRenderer.render_cmpl_async's
+    internal pipeline (process_for_engine_async) only carries over fields
+    it explicitly knows about, so `additional_information` set on the
+    pre-render prompt (e.g. buffer_realtime_audio's `speaker`) was silently
+    dropped and never reached the engine - the voice selection feature
+    looked correct in isolation but produced no audible effect. Fixed by
+    reapplying it to the rendered engine_input, mirroring how
+    serving_chat.py._preprocess_chat does it for /v1/chat/completions."""
+
+    def _conn_with_fake_renderer(self, mocker, rendered_engine_input: dict):
+        conn = RealtimeConnection.__new__(RealtimeConnection)
+        conn.serving = mocker.Mock()
+        conn.serving.model_config.is_encoder_decoder = False
+        conn.serving.renderer.render_cmpl_async = mocker.AsyncMock(return_value=[rendered_engine_input])
+        return conn
+
+    def test_additional_information_survives_render(self, mocker) -> None:
+        # render_cmpl_async's fake return simulates the real pipeline: it never
+        # echoes back fields it doesn't recognize, so additional_information
+        # must NOT be in here even though the input prompt has it.
+        rendered = {"prompt_token_ids": [1, 2, 3]}
+        conn = self._conn_with_fake_renderer(mocker, rendered)
+        prompt = TokensPrompt(prompt_token_ids=[1, 2, 3], additional_information={"speaker": ["aiden"]})
+
+        result = asyncio.run(conn._render_prompt(prompt))
+
+        assert result.prompt["additional_information"] == {"speaker": ["aiden"]}
+
+    def test_no_additional_information_is_a_noop(self, mocker) -> None:
+        rendered = {"prompt_token_ids": [1, 2, 3]}
+        conn = self._conn_with_fake_renderer(mocker, rendered)
+        prompt = TokensPrompt(prompt_token_ids=[1, 2, 3])
+
+        result = asyncio.run(conn._render_prompt(prompt))
+
+        assert "additional_information" not in result.prompt
