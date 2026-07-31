@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any, cast
 from uuid import uuid4
@@ -70,6 +71,62 @@ class RealtimeConnection(VllmRealtimeConnection):
         # index (parser-assigned, per generation) -> {"call_id", "name", "arguments"}
         self._pending_tool_calls: dict[int, dict[str, Any]] = {}
         self._tool_result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # Prior conversation as an ordered message list, replayed into every
+        # subsequent prompt. Entries are {"role": ..., "audio": np.ndarray} for the
+        # user's spoken turns and {"role": ..., "content": str} otherwise. A flat
+        # message list (rather than user/assistant pairs) is what lets a completed
+        # TOOL turn be replayed in full - assistant `<tool_call>`, the
+        # `<tool_response>` result, then the spoken answer - which the model needs
+        # in order to keep calling tools on later turns. See _handle_history_item.
+        self._history: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _decode_pcm16(b64_audio: str) -> np.ndarray:
+        """Same PCM16 -> float32 conversion the base class applies to
+        `input_audio_buffer.append`, so history audio and live audio are
+        represented identically."""
+        return np.frombuffer(base64.b64decode(b64_audio), dtype=np.int16).astype(np.float32) / 32768.0
+
+    async def _handle_history_item(self, item: dict) -> None:
+        """Append a prior conversation turn, OpenAI-Realtime shaped:
+
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_audio", "audio": "<b64 pcm16>"}]}
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "text", "text": "..."}]}
+            {"type": "message", "role": "tool",
+             "content": [{"type": "text", "text": "<tool result>"}]}
+
+        A completed tool turn MUST be replayed in full: the assistant message
+        carrying the `<tool_call>` block, then the `tool` message with its result,
+        then the spoken answer. Replaying only the answer makes the history read as
+        "the model answers these questions from its own knowledge", and it stops
+        calling the tool on later turns and confabulates instead - reproduced on the
+        reference HF path, so it is the prompt shape rather than any serving detail.
+        Conversely a `<tool_call>` replayed with no matching result reads as an
+        unanswered call, and the model retries it indefinitely.
+        """
+        role = item.get("role")
+        contents = item.get("content") or []
+        if role == "user":
+            audio_b64 = next(
+                (c.get("audio") for c in contents if c.get("type") in ("input_audio", "audio") and c.get("audio")),
+                None,
+            )
+            if audio_b64 is None:
+                await self.send_error("history user message needs input_audio content", "invalid_history_item")
+                return
+            self._history.append({"role": "user", "audio": self._decode_pcm16(audio_b64)})
+        elif role in ("assistant", "tool"):
+            text = " ".join(c.get("text") or "" for c in contents if c.get("type") == "text").strip()
+            if not text:
+                await self.send_error(f"history {role} message needs text content", "invalid_history_item")
+                return
+            self._history.append({"role": role, "content": text})
+        else:
+            await self.send_error(f"Unsupported history message role: {role!r}", "invalid_history_item")
+            return
+        logger.info("realtime history: %d message(s) queued for replay", len(self._history))
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -86,10 +143,13 @@ class RealtimeConnection(VllmRealtimeConnection):
             await super().handle_event(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
-            if item.get("type") == "function_call_output":
+            item_type = item.get("type")
+            if item_type == "function_call_output":
                 self._tool_result_queue.put_nowait(item)
+            elif item_type == "message":
+                await self._handle_history_item(item)
             else:
-                await self.send_error(f"Unsupported conversation.item type: {item.get('type')!r}", "unsupported_item")
+                await self.send_error(f"Unsupported conversation.item type: {item_type!r}", "unsupported_item")
         else:
             await super().handle_event(event)
 
@@ -138,6 +198,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             tools=self._tools,
             speaker=self._speaker,
             instructions=self._instructions,
+            history=self._history,
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
@@ -493,6 +554,16 @@ class RealtimeConnection(VllmRealtimeConnection):
         # front, still un-expanded.
         if self._turn_prompt is not None:
             self._turn_prompt = {**base_prompt, "prompt_token_ids": continuation_token_ids}
+
+        # The tool-call continuation is a SEPARATE prompt-building path from
+        # buffer_realtime_audio, and is where the missing `<|im_end|>` hid. Log it too.
+        if os.environ.get("OMNI_DEBUG_DUMP_DIR"):
+            logger.info(
+                "OMNIDBG continuation (%d tokens, audio re-attached=%s):\n%s",
+                len(continuation_token_ids),
+                bool(multi_modal_data),
+                tokenizer.decode(continuation_token_ids),
+            )
 
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
         await self._run_generation(self._render_token_prompt(continuation_token_ids, multi_modal_data), input_stream)

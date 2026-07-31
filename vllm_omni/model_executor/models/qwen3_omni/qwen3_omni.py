@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -230,6 +231,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         tools: list[dict[str, Any]] | None = None,
         speaker: str | None = None,
         instructions: str | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -244,7 +246,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        if tools or instructions:
+        # Prior conversation as an ordered message list. User turns carry the
+        # ORIGINAL AUDIO (`{"role": "user", "audio": ndarray}`) because this endpoint
+        # is audio-in and returns only the model's own reply text - there is no
+        # transcript of the user's speech to replay. Everything else carries text,
+        # including the `assistant` message holding a `<tool_call>` and the `tool`
+        # message holding its result: a completed tool turn has to be replayed in
+        # full or the model stops calling tools on later turns (it reads the history
+        # as "answer these from knowledge") and confabulates instead. Cheap in
+        # context: audio costs ~25 thinker tokens/second here.
+        history = list(history or [])
+        # Drop a trailing user turn with no reply yet - that is the turn being
+        # spoken now, and replaying it would duplicate the live audio.
+        while history and history[-1].get("role") == "user":
+            history.pop()
+
+        if tools or instructions or history:
             # Render through the model's own chat template (rather than the
             # hardcoded f-string below) so the thinker gets the <tools>...</tools>
             # system preamble and <tool_call></tool_call> output format it was
@@ -273,9 +290,18 @@ class Qwen3OmniMoeForConditionalGeneration(
             # always wins and still respects `tools` when applying it).
             from vllm.renderers.hf import safe_apply_chat_template
 
+            # Replay the prior messages verbatim, then the turn being spoken now.
+            # Each replayed user turn becomes an audio placeholder; the placeholders
+            # are matched POSITIONALLY against the multi_modal_data audio list below,
+            # so the two MUST stay in the same order and count.
             messages: list[dict[str, Any]] = []
             if instructions:
                 messages.append({"role": "system", "content": instructions})
+            for past in history:
+                if past.get("role") == "user":
+                    messages.append({"role": "user", "content": audio_placeholder})
+                else:
+                    messages.append({"role": past.get("role") or "assistant", "content": past.get("content") or ""})
             messages.append({"role": "user", "content": audio_placeholder})
 
             prompt_template = safe_apply_chat_template(
@@ -291,6 +317,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
+
+        # The exact prompt the thinker will see. Every realtime bug found so far came down
+        # to "what did the model actually receive?" and was diagnosed by inferring it one
+        # restart at a time; logging it turns those into a log read. Off unless
+        # OMNI_DEBUG_DUMP_DIR is set, since it contains the full conversation.
+        if os.environ.get("OMNI_DEBUG_DUMP_DIR"):
+            logger.info(
+                "OMNIDBG prompt (%d tokens, %d audio placeholder(s), %d history msg(s)):\n%s",
+                len(prompt_token_ids),
+                prompt_template.count("<|audio_pad|>"),
+                len(history),
+                prompt_template,
+            )
         # Same shape /v1/chat/completions uses (serving_chat.py): a one-element
         # list under "speaker" in additional_information, read back out by
         # talker_preprocess_prefill via payload.get("speaker").
@@ -304,6 +343,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # flush so the thinker sees one complete prompt.
         async_chunk = getattr(model_config, "async_chunk", False)
 
+        # Same order as the replayed user placeholders above.
+        past_audio = [p["audio"] for p in history if p.get("role") == "user" and p.get("audio") is not None]
+
+        def _mm(current: np.ndarray) -> dict[str, Any]:
+            # Prior turns first, current turn last - same order as the audio
+            # placeholders rendered above. With no history keep passing the bare
+            # array rather than a 1-element list, so the existing single-turn
+            # path stays byte-identical.
+            return {"audio": [*past_audio, current] if past_audio else current}
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
@@ -311,7 +360,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 while (segment := buffer.read_audio()) is not None:
                     yield TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
-                        multi_modal_data={"audio": segment},
+                        multi_modal_data=_mm(segment),
                         **extra_prompt_kwargs,
                     )
 
@@ -319,7 +368,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if remaining is not None and len(remaining) > 0:
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
-                multi_modal_data={"audio": remaining},
+                multi_modal_data=_mm(remaining),
                 **extra_prompt_kwargs,
             )
 
