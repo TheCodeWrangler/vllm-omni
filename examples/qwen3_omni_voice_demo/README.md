@@ -22,19 +22,30 @@ All four are based on `main` and all four edit
 | #5566 | `pr3-instructions` | `instructions` (system prompt) support |
 | #5655 | `feat/realtime-audio-history` | Conversation history: replays prior turns' audio + the whole tool exchange |
 
-Measured merge behaviour against `upstream/main` at `d33c905d`:
+These are now a **linear stack**, rebased onto current `main` and verified to
+land in order:
 
 ```
-each PR alone onto main:          all four CLEAN
-cumulative, in the order above:   #5555 CLEAN, then #5565 CONFLICTS
-                                  (all three files, incl. the shared test file)
+1. #5555 tool-calling   CLEAN onto main
+2. #5565 voice          CLEAN onto #5555
+3. #5566 instructions   CLEAN onto #5565
+4. #5655 history        CLEAN onto #5566
 ```
 
-So they cannot simply be merged in any order. **Land them one at a time, rebasing
-each survivor onto the new `main` after the previous one merges.** The commits on
-this branch are the reference resolution: they are the version that was actually
-run and verified end to end, so a rebase whose result diverges from this tree is
-probably wrong.
+They were originally four independent siblings all based on `main`, which merged
+cleanly *alone* but conflicted with each other (#5555 landed, then #5565
+conflicted in all three files). Restacking fixed that; the merged tree is
+byte-identical to this branch's tree modulo the two deltas noted below, and the
+unit tests pass at every level (36 -> 44 -> 47 -> 54 tests).
+
+Stacking also surfaced a bug neither PR had alone: with tool calling **and**
+voice selection both present, the tool-call continuation builds its own
+`TokensPrompt` and so dropped the `speaker`, making the voice audibly change
+halfway through a tool-calling turn. Fixed in #5565.
+
+This branch differs from the stack tip by exactly two things: it lacks the
+"bound tool-call chains" commit, and it carries the `OMNI_DEBUG_DUMP_DIR` debug
+capture, which is deliberately not proposed upstream.
 
 ### Bugs found while getting this working
 
