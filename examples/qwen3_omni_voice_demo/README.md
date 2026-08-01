@@ -6,8 +6,7 @@ calling, multi-turn memory, a grafted custom voice, and speak-ready output.
 
 This branch (`local-demo-combined`) is **not** intended to be merged. It exists to
 record the exact combination of server changes the demo was verified against,
-because that combination is spread across four separate upstream PRs that each
-land cleanly alone but **conflict with each other**.
+which is spread across four upstream PRs (now a linear stack — see below).
 
 ## The four upstream PRs behind this
 
