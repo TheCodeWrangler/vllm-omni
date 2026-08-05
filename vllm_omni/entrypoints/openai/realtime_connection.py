@@ -9,6 +9,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
+from pydantic import ValidationError
 from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
@@ -21,6 +22,17 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.realtime_protocol import (
+    FunctionCallItem,
+    FunctionCallOutputItem,
+    OmniNamedToolChoice,
+    OmniSessionUpdate,
+    ResponseFunctionCallArgumentsDelta,
+    ResponseFunctionCallArgumentsDone,
+    ResponseOutputItemAdded,
+    first_error_message,
+    lift_session_fields,
+)
 from vllm_omni.entrypoints.openai.realtime_tool_calls import ToolCallDelta, ToolCallStreamState, extract_deltas
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 
@@ -50,8 +62,12 @@ class RealtimeConnection(VllmRealtimeConnection):
     generation output handling to emit audio deltas and tool-call events.
 
     Tool-calling protocol (mirrors OpenAI's Realtime API event shapes):
-      - client -> server: `session.update` gains an optional `tools` field
-        (list of OpenAI-style tool/function definitions).
+      - client -> server: `session.update` gains optional `tools` (a list of
+        function definitions) and `tool_choice` (`"none"`/`"auto"`/`"required"`,
+        or a function named as `{"type": "function", "name": ...}`) fields,
+        nested under a `session` object as the OpenAI Realtime API puts them or
+        flat on the event - see realtime_protocol.py, which owns every accepted
+        shape and validates them.
       - server -> client, once the model starts a tool call:
         `response.output_item.added` (item.type="function_call", name, call_id)
         `response.function_call_arguments.delta` (call_id, delta)
@@ -78,9 +94,22 @@ class RealtimeConnection(VllmRealtimeConnection):
     - **Non-duplex only.** This is the half-duplex `/v1/realtime` path. The
       full-duplex runtime under `experimental/fullduplex/` has no tool-calling
       support and shares no code with this.
-    - **Requires `async_chunk` disabled.** `session.update` with `tools` is
-      rejected when the server runs in async-chunk mode; see
-      `_async_chunk_enabled` for why aggregating instead would not be enough.
+    - **Requires `async_chunk` disabled.** A `session.update` that DECLARES tools
+      is rejected when the server runs in async-chunk mode (`tools: []` still
+      clears them, which that mode can do); see `_parse_session_tools` for why
+      aggregating the audio instead would not be enough.
+    - **`tool_choice` is recorded, not enforced.** `"none"` genuinely disables
+      tool calling for the session - no `<tools>` preamble in the prompt and no
+      scanning of the generated text (see `_active_tools`) - and so does an
+      empty `tools` list, which is how a client clears its tools. `"required"`
+      and a named function both behave like `"auto"` (the default): forcing any
+      call, let alone a specific one, needs guided decoding, whereas this path
+      drives the engine with plain sampling params and parses `<tool_call>` out
+      of the text afterwards. Both are accepted rather than refused so a client
+      written against the OpenAI API keeps working; a named function is treated
+      as `"required"` and the name it asked for is not kept, since nothing here
+      could act on it. The downgrade is logged once per session
+      (`_warn_tool_choice_not_enforced`) rather than pretended to.
     - **Waits on client liveness.** Once the model has requested a tool, the turn
       blocks until a `function_call_output` arrives for every pending call. There
       is deliberately no deadline, because a slow tool is indistinguishable from
@@ -96,6 +125,18 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
         self._tools: list[dict[str, Any]] | None = None
+        # `"none"`/`"auto"`/`"required"`, per session, defaulting to `"auto"` as
+        # the OpenAI API does; a named function is recorded as `"required"`. Only
+        # `"none"` changes behavior - see _active_tools and the class docstring's
+        # scope notes.
+        self._tool_choice: str = "auto"
+        # Whether this session has already been told that its `tool_choice`
+        # cannot be enforced - see _warn_tool_choice_not_enforced.
+        self._tool_choice_not_enforced_warned = False
+        # The tools this turn runs with, latched by start_generation so that a
+        # `session.update` arriving mid-turn cannot desynchronize the extractor
+        # from the prompt the model is still answering - see _active_tools.
+        self._turn_tools: list[dict[str, Any]] | None = None
         # The current turn's prompt as handed to the engine BEFORE multimodal
         # expansion: un-expanded `prompt_token_ids` (one `<|audio_pad|>`) plus the
         # audio in `multi_modal_data`. Tool-call continuations rebuild from this
@@ -112,25 +153,7 @@ class RealtimeConnection(VllmRealtimeConnection):
     async def handle_event(self, event: dict):
         event_type = event.get("type")
         if event_type == "session.update":
-            tools = event.get("tools")
-            if tools is not None:
-                if self._async_chunk_enabled():
-                    # Refuse rather than half-work. Two independent things break
-                    # under async_chunk: the buffer yields one TokensPrompt per
-                    # segment, so a tool-call continuation would reattach only the
-                    # final segment's audio and lose the start of the utterance;
-                    # and the generation loop never sees one complete thinker turn
-                    # to scan for a <tool_call> block. Aggregating the audio would
-                    # fix only the first, leaving the feature looking supported
-                    # while still broken -- so the limitation is explicit instead.
-                    await self.send_error(
-                        "Tool calling on /v1/realtime requires async_chunk to be disabled "
-                        "(serve with --no-async-chunk); tools were not applied.",
-                        "tools_require_no_async_chunk",
-                    )
-                else:
-                    self._tools = tools
-            await super().handle_event(event)
+            await self._handle_session_update(event)
         elif event_type == "conversation.item.create":
             item = event.get("item") or {}
             if item.get("type") == "function_call_output":
@@ -139,6 +162,171 @@ class RealtimeConnection(VllmRealtimeConnection):
                 await self.send_error(f"Unsupported conversation.item type: {item.get('type')!r}", "unsupported_item")
         else:
             await super().handle_event(event)
+
+    async def _handle_session_update(self, event: dict) -> None:
+        """Route a `session.update` past upstream, then apply its tool fields.
+
+        Parsed before `super().handle_event`, applied after it: upstream owns
+        `model`, and tool state must not outlive an event whose session was never
+        validated. A refused `{"tool_choice": "none"}` used to disable tool
+        calling permanently, since no later update that omits `tool_choice` can
+        undo it.
+
+        Whether the session is validated is upstream's own
+        `_is_model_validated`, which it sets when it takes a `session.update` and
+        never clears - so tool state sticks only once a model this server serves
+        has been accepted, and after that the session keeps taking tool updates
+        that omit `model`, which is what clients send (upstream still answers
+        those with its "Missing required field: model" error - its call, and the
+        same as on the base branch, where the tools were applied too). The flag
+        being sticky is also its limit: once a session is validated, an update
+        naming a model upstream refuses still has its tool fields applied. Telling
+        those apart would mean re-deciding `model` here, which is the one thing
+        this method exists not to do.
+
+        A session that has not been validated yet gets one error per event:
+        upstream's refusal is reported by upstream, and a second complaint about
+        the tool fields of an event that has to be resent anyway would only add
+        noise.
+        """
+        update, refusal = self._parse_session_tools(event)
+        await super().handle_event(self._with_top_level_model(event))
+        # Fail open: if a future upstream drops the attribute, tool updates keep
+        # working rather than every `session.update` raising in here.
+        if not getattr(self, "_is_model_validated", True):
+            return  # upstream refused the session and said why; nothing of ours applies
+        if refusal is not None:
+            await self.send_error(*refusal)
+        if update is not None:
+            self._apply_session_tools(update)
+
+    @staticmethod
+    def _with_top_level_model(event: dict) -> dict:
+        """The event as upstream reads it, with `model` at the top level.
+
+        The canonical OpenAI Realtime `session.update` carries `model` inside the
+        `session` object, but upstream's `handle_event` reads it off the top
+        level - so a spec-shaped event was refused as "Missing required field:
+        model" and took its `tools` down with it, which made this endpoint's
+        nested-`session` support unreachable for the clients it exists for.
+
+        Lifted into a shallow copy, never into the caller's dict, which the tests
+        assert stays as it arrived. A `model` already at the top level always
+        wins: that field is upstream's, and this only fills it in.
+        """
+        session = event.get("session")
+        if event.get("model") is not None or not isinstance(session, dict):
+            return event
+        model = session.get("model")
+        if model is None:
+            return event
+        return {**event, "model": model}
+
+    def _parse_session_tools(self, event: dict) -> tuple[OmniSessionUpdate | None, tuple[str, str] | None]:
+        """Validate the tool fields of a `session.update` without applying them.
+
+        Returns the parsed event and the (message, code) to report, if any; the
+        caller applies neither until upstream has validated the session itself.
+        Shape errors are protocol errors, so they are caught here rather than
+        discovered later inside the chat template.
+        """
+        lifted = lift_session_fields(event)
+        try:
+            update = OmniSessionUpdate.model_validate(lifted)
+        except ValidationError as e:
+            # Described against `lifted`, the mapping pydantic validated, so the
+            # field path names the keys the client actually sent.
+            return None, (first_error_message(e, lifted), "invalid_session_update")
+        if update.tools and self._async_chunk_enabled():
+            # Refuse rather than half-work. Two independent things break under
+            # async_chunk: the buffer yields one TokensPrompt per segment, so a
+            # tool-call continuation would reattach only the final segment's
+            # audio and lose the start of the utterance; and the generation loop
+            # never sees one complete thinker turn to scan for a <tool_call>
+            # block. Aggregating the audio would fix only the first, leaving the
+            # feature looking supported while still broken -- so the limitation
+            # is explicit instead. `tool_choice` is still recorded: it is session
+            # state, and a later update may bring tools this server can apply.
+            #
+            # Only a NON-empty list gets here: `tools: []` is how a client clears
+            # its tools, and refusing a clear would leave the previous tools in
+            # place - the opposite of what was asked, for a request that needs
+            # nothing this mode cannot do.
+            update.tools = None
+            return update, (
+                "Tool calling on /v1/realtime requires async_chunk to be disabled "
+                "(serve with --no-async-chunk); tools were not applied.",
+                "tools_require_no_async_chunk",
+            )
+        return update, None
+
+    def _apply_session_tools(self, update: OmniSessionUpdate) -> None:
+        """Record the tool state of an accepted `session.update`.
+
+        A field the event does not carry leaves the session's current value
+        alone, so `tools` and `tool_choice` can be set in separate updates.
+        """
+        if update.tools is not None:
+            # Plain dicts again for the chat template, in the nested
+            # `{"type": "function", "function": {...}}` form whichever shape the
+            # client sent. `exclude_none` drops the optional fields it never set,
+            # so a nested definition comes back as it arrived - except that
+            # ChatCompletionToolsParam's validator copies a tool-level
+            # `defer_loading` down into `function`.
+            self._tools = [tool.model_dump(exclude_none=True) for tool in update.tools]
+        if update.tool_choice is not None:
+            if isinstance(update.tool_choice, OmniNamedToolChoice):
+                # The closest this path can get: the tools stay active and the
+                # request is treated as `"required"`. The name itself is NOT kept
+                # - nothing on this path could act on it, and state nothing reads
+                # only invites the belief that something does.
+                self._tool_choice = "required"
+                self._warn_tool_choice_not_enforced(f"the function {update.tool_choice.function.name!r}")
+            else:
+                self._tool_choice = update.tool_choice
+                if update.tool_choice == "required":
+                    self._warn_tool_choice_not_enforced("required")
+
+    def _warn_tool_choice_not_enforced(self, requested: str) -> None:
+        """Say once per session that a `tool_choice` was recorded, not enforced.
+
+        `"required"` and a named function are accepted so a client written
+        against the OpenAI API keeps working, but this path drives the engine with
+        plain sampling params, so neither can be forced - see the class
+        docstring's scope notes. Told to the operator's log rather than the
+        client, because it is not an error and the endpoint sends no
+        `session.updated` event to carry it (neither does upstream). Once per
+        session: a client that sets it on every `session.update` would otherwise
+        fill the log with it.
+        """
+        if self._tool_choice_not_enforced_warned:
+            return
+        self._tool_choice_not_enforced_warned = True
+        logger.warning(
+            "session.update asked for tool_choice=%s; /v1/realtime records it but cannot enforce it "
+            '(no guided decoding on this path), so it behaves like "auto" and the model may answer '
+            "without calling a tool",
+            requested,
+        )
+
+    def _active_tools(self) -> list[dict[str, Any]] | None:
+        """This session's tools, or None when tool calling is off.
+
+        The single decision behind both halves of the feature: None keeps the
+        `<tools>` preamble out of the rendered prompt (`buffer_realtime_audio`
+        renders the plain template) and keeps `_run_generation` from scanning the
+        generated text for `<tool_call>`. Off means `tool_choice="none"` or no
+        tools - and `tools: []` is how a client clears its tools, so it has to
+        mean the same as never having declared any, not "declare nothing, then
+        parse calls the prompt never offered".
+
+        Declared tools stay on the session either way, so a later
+        `session.update` can turn them back on with `"auto"` without resending
+        them.
+        """
+        if self._tool_choice == "none" or not self._tools:
+            return None
+        return self._tools
 
     def _async_chunk_enabled(self) -> bool:
         """Whether the server runs in async-chunk mode.
@@ -153,27 +341,20 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         Without this, any dict carrying the right `type` was accepted: a missing
         or non-string `call_id` never matched a pending call, and `output` was
-        coerced with `str()`. A client typo therefore left generation waiting
-        with nothing reported back. Shape errors are protocol errors, so they are
-        rejected here rather than discovered later.
-
-        (Kept as explicit checks for now; supersede with pydantic tool-event
-        models when those land.)
+        coerced with `str()`, so a client typo left generation waiting with
+        nothing reported back. The shape itself lives in
+        `FunctionCallOutputItem`; whether a well-formed `call_id` matches a call
+        this turn actually made is answered later against the pending map
+        (`unknown_tool_call_id` in `_await_tool_results_and_continue`).
         """
-        call_id = item.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            await self.send_error(
-                "function_call_output requires a non-empty string 'call_id'",
-                "invalid_function_call_output",
-            )
+        try:
+            FunctionCallOutputItem.model_validate(item)
+        except ValidationError as e:
+            await self.send_error(first_error_message(e, item), "invalid_function_call_output")
             return
-        output = item.get("output")
-        if not isinstance(output, str):
-            await self.send_error(
-                f"function_call_output 'output' must be a string, got {type(output).__name__}",
-                "invalid_function_call_output",
-            )
-            return
+        # The client's own dict is what gets queued: the wait loop reads
+        # `call_id`/`output` straight off it, and re-serializing the validated
+        # model here would only add a way for the two to drift.
         self._tool_result_queue.put_nowait(item)
 
     async def start_generation(self):
@@ -187,6 +368,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._tool_rounds = 0
         while not self._tool_result_queue.empty():
             self._tool_result_queue.get_nowait()
+
+        # Decided once for the whole turn, including the continuations after a
+        # tool result: the prompt below is rendered with (or without) the <tools>
+        # preamble, and every generation in this turn scans the model's text on
+        # exactly that basis.
+        self._turn_tools = self._active_tools()
 
         audio_stream = self.audio_stream_generator()
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
@@ -205,13 +392,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         input_stream: asyncio.Queue[list[int]],
     ) -> AsyncGenerator[StreamingInput, None]:
         """Equivalent to `OpenAIServingRealtime.transcribe_realtime`, but
-        threads `self._tools` through to the model's `buffer_realtime_audio`.
-        The base class's `transcribe_realtime` has a fixed
-        (audio_stream, input_stream, model_config) call signature with no
+        threads this turn's tools through to the model's
+        `buffer_realtime_audio`. The base class's `transcribe_realtime` has a
+        fixed (audio_stream, input_stream, model_config) call signature with no
         seam for extra per-connection state like tools, so this reimplements
         its (short) body directly rather than patching upstream vLLM."""
         stream_input_iter = self.serving.model_cls.buffer_realtime_audio(
-            audio_stream, input_stream, self.serving.model_config, tools=self._tools
+            audio_stream, input_stream, self.serving.model_config, tools=self._turn_tools
         )
         async for prompt in stream_input_iter:
             # Remember the pre-expansion prompt so tool-call continuations can
@@ -323,10 +510,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 call = _PendingToolCall(call_id=f"call_{uuid4().hex[:24]}", name=delta.name)
                 self._pending_tool_calls[delta.index] = call
                 await self.send_json(
-                    {
-                        "type": "response.output_item.added",
-                        "item": {"type": "function_call", "name": call.name, "call_id": call.call_id},
-                    }
+                    ResponseOutputItemAdded(item=FunctionCallItem(name=call.name, call_id=call.call_id)).model_dump()
                 )
             if delta.arguments_delta:
                 call = self._pending_tool_calls.get(delta.index)
@@ -334,11 +518,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     continue  # shouldn't happen: name delta always precedes argument deltas for the same index
                 call.arguments += delta.arguments_delta
                 await self.send_json(
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "call_id": call.call_id,
-                        "delta": delta.arguments_delta,
-                    }
+                    ResponseFunctionCallArgumentsDelta(call_id=call.call_id, delta=delta.arguments_delta).model_dump()
                 )
 
     async def _run_generation(
@@ -358,6 +538,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         assistant_token_ids: list[int] = []
         tool_state = ToolCallStreamState()
         self._pending_tool_calls = {}
+        # The turn's own decision, not the session's current one: this runs again
+        # for a tool-call continuation, whose prompt still carries the <tools>
+        # preamble and the call history, so a `session.update` that arrives while
+        # the client is running the tool must not stop the extractor scanning it -
+        # nor start it scanning a prompt that never declared any tools.
+        tools_active = self._turn_tools is not None
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -396,12 +582,19 @@ class RealtimeConnection(VllmRealtimeConnection):
                     full_text += delta_text
                     completion_tokens_len += len(new_token_ids)
 
-                    if delta_text:
+                    if delta_text and tools_active:
                         content_delta, tool_deltas = extract_deltas(full_text, tool_state)
                         if content_delta:
                             await self.send(TranscriptionDelta(delta=content_delta))
                         if tool_deltas:
                             await self._emit_tool_call_deltas(tool_deltas)
+                    elif delta_text:
+                        # No tools this turn: stream the text as it comes, the way
+                        # this endpoint did before tool calling existed. Nothing
+                        # parses <tool_call>, so `tool_state` stays empty and every
+                        # gate reading it below (audio suppression, the tool-result
+                        # wait, the terminal event) takes the plain path.
+                        await self.send(TranscriptionDelta(delta=delta_text))
 
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
                 if audio_chunks and not tool_state.has_tool_calls():
@@ -425,11 +618,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             if tool_state.has_tool_calls():
                 for call in self._pending_tool_calls.values():
                     await self.send_json(
-                        {
-                            "type": "response.function_call_arguments.done",
-                            "call_id": call.call_id,
-                            "arguments": call.arguments,
-                        }
+                        ResponseFunctionCallArgumentsDone(call_id=call.call_id, arguments=call.arguments).model_dump()
                     )
                 if self._is_connected:
                     await self._await_tool_results_and_continue(request_prompt_token_ids, assistant_token_ids)
